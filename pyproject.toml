@@ -1,62 +1,21 @@
 [build-system]
-requires = ["hatchling>=1.24"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-output-store"
 version = "0.1.0"
-description = "Persistent artifact store for agent outputs. Tag, search, and retrieve results and reports across runs. Zero runtime deps."
+description = "Thread-safe JSONL artifact store for agent run outputs"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Mukunda Rao Katta", email = "mukunda.vjcs6@gmail.com" }]
-keywords = [
-  "llm",
-  "ai",
-  "agents",
-  "artifacts",
-  "persistence",
-  "store",
-  "output",
-  "tagging",
-  "search",
-]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+keywords = ["agent", "artifacts", "store", "jsonl", "logging"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
-  "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4"]
-
-[project.urls]
-Homepage = "https://github.com/MukundaKatta/agent-output-store"
-Issues = "https://github.com/MukundaKatta/agent-output-store/issues"
-Source = "https://github.com/MukundaKatta/agent-output-store"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/agent_output_store"]
-
-[tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/LICENSE"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-
-[tool.ruff]
-target-version = "py310"
-line-length = 100
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+[tool.setuptools.packages.find]
+where = ["src"]

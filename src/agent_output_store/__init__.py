@@ -1,219 +1,184 @@
 """
-agent-output-store: Persistent artifact store for agent outputs.
-
-Stores named content artifacts with tags and metadata in a JSONL file.
-Artifacts survive across runs. Supports tag filtering, substring search,
-and thread-safe concurrent access.
+agent-output-store: JSONL artifact store for agent run outputs.
 """
+from __future__ import annotations
 
 import json
 import os
 import threading
-import uuid
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 
-class ArtifactNotFoundError(Exception):
-    """Raised when an artifact id is not found or has been deleted."""
-
-
-@dataclass(frozen=True)
+@dataclass
 class Artifact:
-    """An immutable artifact record."""
-
-    id: str  # uuid4 hex
-    name: str
-    content: str
+    artifact_id: str
+    kind: str
+    data: Any
+    run_id: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
     tags: list[str] = field(default_factory=list)
-    created_at: str = ""  # ISO 8601 UTC
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "kind": self.kind,
+            "data": self.data,
+            "run_id": self.run_id,
+            "created_at": self.created_at,
+            "tags": self.tags,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Artifact":
+        return cls(
+            artifact_id=d["artifact_id"],
+            kind=d["kind"],
+            data=d["data"],
+            run_id=d.get("run_id"),
+            created_at=d.get("created_at", time.time()),
+            tags=d.get("tags", []),
+            metadata=d.get("metadata", {}),
+        )
+
+
+class ArtifactNotFound(KeyError):
+    pass
 
 
 class OutputStore:
     """
-    Persistent artifact store backed by a JSONL file.
+    Thread-safe JSONL artifact store for agent run outputs.
 
-    Each line in the file is one of:
-    - A full artifact JSON object (all fields)
-    - {"_deleted": "<artifact_id>"}  — marks that id as deleted
-    - {"_cleared": true}              — marks all prior artifacts as deleted
+    Artifacts are appended to a JSONL file and kept in an in-memory index.
+    Supports store, get, list, search, delete, and clear.
 
-    On load the log is replayed in order; _cleared resets in-memory state,
-    _deleted removes a specific id. This means appending is the only write
-    operation, which keeps concurrent access simple and avoids corruption.
+    Usage::
+
+        store = OutputStore("/tmp/run.jsonl")
+        store.store("run-1", "llm_response", {"content": "Hello!"}, tags=["prod"])
+        artifact = store.get("run-1")
+        results = store.search(kind="llm_response")
     """
 
-    def __init__(self, persist_path: str) -> None:
-        self._path = os.path.expanduser(persist_path)
-        parent = os.path.dirname(self._path)
-        os.makedirs(parent if parent else ".", exist_ok=True)
-        self._lock = threading.RLock()
-        # Ordered dict: id -> Artifact (non-deleted only)
-        self._artifacts: dict[str, Artifact] = {}
-        self._load()
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._path = path
+        self._index: dict[str, Artifact] = {}
+        self._lock = threading.Lock()
+        self._counter = 0
+        if path and os.path.exists(path):
+            self._load(path)
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-
-    def _load(self) -> None:
-        """Replay the JSONL log into in-memory state."""
-        if not os.path.exists(self._path):
-            return
-        with open(self._path, encoding="utf-8") as fh:
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
+    def _load(self, path: str) -> None:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    record = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue  # skip corrupt lines
+                    d = json.loads(line)
+                    a = Artifact.from_dict(d)
+                    self._index[a.artifact_id] = a
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-                if "_cleared" in record:
-                    self._artifacts.clear()
-                elif "_deleted" in record:
-                    self._artifacts.pop(record["_deleted"], None)
-                else:
-                    # Full artifact record
-                    try:
-                        artifact = Artifact(
-                            id=record["id"],
-                            name=record["name"],
-                            content=record["content"],
-                            tags=record.get("tags", []),
-                            created_at=record.get("created_at", ""),
-                            metadata=record.get("metadata", {}),
-                        )
-                        self._artifacts[artifact.id] = artifact
-                    except (KeyError, TypeError):
-                        continue  # skip malformed lines
-
-    def _append(self, record: dict) -> None:
-        """Append a JSON record to the JSONL file."""
-        with open(self._path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+    def _next_id(self) -> str:
+        self._counter += 1
+        return f"artifact-{self._counter:06d}"
 
     def store(
         self,
-        name: str,
-        content: str,
-        tags: list[str] | None = None,
-        **metadata,
+        run_id: Optional[str] = None,
+        kind: str = "output",
+        data: Any = None,
+        tags: Optional[list[str]] = None,
+        artifact_id: Optional[str] = None,
+        **metadata: Any,
     ) -> Artifact:
-        """
-        Create and persist a new artifact.
-
-        Extra keyword arguments are stored in the artifact's metadata dict.
-        Returns the created Artifact.
-        """
-        artifact = Artifact(
-            id=uuid.uuid4().hex,
-            name=name,
-            content=content,
-            tags=list(tags) if tags is not None else [],
-            created_at=datetime.now(tz=timezone.utc).isoformat(),
-            metadata=dict(metadata),
-        )
-        record = {
-            "id": artifact.id,
-            "name": artifact.name,
-            "content": artifact.content,
-            "tags": artifact.tags,
-            "created_at": artifact.created_at,
-            "metadata": artifact.metadata,
-        }
         with self._lock:
-            self._artifacts[artifact.id] = artifact
-            self._append(record)
+            aid = artifact_id or self._next_id()
+            artifact = Artifact(
+                artifact_id=aid,
+                kind=kind,
+                data=data,
+                run_id=run_id,
+                tags=tags or [],
+                metadata=metadata,
+            )
+            self._index[aid] = artifact
+            if self._path:
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(artifact.to_dict()) + "\n")
         return artifact
 
     def get(self, artifact_id: str) -> Artifact:
-        """
-        Return the artifact with the given id.
+        a = self._index.get(artifact_id)
+        if a is None:
+            raise ArtifactNotFound(artifact_id)
+        return a
 
-        Raises ArtifactNotFoundError if it does not exist or was deleted.
-        """
-        with self._lock:
-            if artifact_id not in self._artifacts:
-                raise ArtifactNotFoundError(artifact_id)
-            return self._artifacts[artifact_id]
+    def get_or_none(self, artifact_id: str) -> Optional[Artifact]:
+        return self._index.get(artifact_id)
 
-    def list(self, tag: str | None = None) -> list[Artifact]:
-        """
-        Return all non-deleted artifacts sorted newest-first.
-
-        If tag is given, only return artifacts that include that tag.
-        """
-        with self._lock:
-            artifacts = list(self._artifacts.values())
-
+    def list(
+        self,
+        run_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        tag: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Artifact]:
+        results = list(self._index.values())
+        if run_id is not None:
+            results = [a for a in results if a.run_id == run_id]
+        if kind is not None:
+            results = [a for a in results if a.kind == kind]
         if tag is not None:
-            artifacts = [a for a in artifacts if tag in a.tags]
+            results = [a for a in results if tag in a.tags]
+        results.sort(key=lambda a: a.created_at)
+        if limit is not None:
+            results = results[:limit]
+        return results
 
-        # Sort by created_at descending; fall back to id for stable tie-breaking
-        artifacts.sort(key=lambda a: (a.created_at, a.id), reverse=True)
-        return artifacts
-
-    def search(self, query: str) -> list[Artifact]:
-        """
-        Case-insensitive substring search across artifact name and content.
-
-        An empty query returns all artifacts (same as list()).
-        Results are sorted newest-first.
-        """
-        with self._lock:
-            artifacts = list(self._artifacts.values())
-
-        lower = query.lower()
-        if lower:
-            artifacts = [
-                a for a in artifacts if lower in a.name.lower() or lower in a.content.lower()
-            ]
-
-        artifacts.sort(key=lambda a: (a.created_at, a.id), reverse=True)
-        return artifacts
+    def search(
+        self,
+        kind: Optional[str] = None,
+        run_id: Optional[str] = None,
+        tag: Optional[str] = None,
+        predicate: Optional[Callable[[Artifact], bool]] = None,
+    ) -> list[Artifact]:
+        results = self.list(run_id=run_id, kind=kind, tag=tag)
+        if predicate is not None:
+            results = [a for a in results if predicate(a)]
+        return results
 
     def delete(self, artifact_id: str) -> bool:
-        """
-        Mark the artifact as deleted.
-
-        Returns True if the artifact existed and was deleted, False if not found.
-        """
         with self._lock:
-            if artifact_id not in self._artifacts:
+            if artifact_id not in self._index:
                 return False
-            del self._artifacts[artifact_id]
-            self._append({"_deleted": artifact_id})
-            return True
-
-    def tags(self) -> list[str]:
-        """Return sorted list of unique tags across all non-deleted artifacts."""
-        with self._lock:
-            all_tags: set[str] = set()
-            for artifact in self._artifacts.values():
-                all_tags.update(artifact.tags)
-        return sorted(all_tags)
+            del self._index[artifact_id]
+        return True
 
     def clear(self) -> int:
-        """
-        Mark all artifacts as deleted.
-
-        Returns the count of artifacts that were deleted.
-        Writes a single {"_cleared": true} sentinel to the JSONL log.
-        """
         with self._lock:
-            count = len(self._artifacts)
-            self._artifacts.clear()
-            self._append({"_cleared": True})
+            count = len(self._index)
+            self._index.clear()
+            self._counter = 0
+            if self._path and os.path.exists(self._path):
+                open(self._path, "w").close()  # truncate
         return count
 
-    def count(self) -> int:
-        """Return the number of non-deleted artifacts."""
-        with self._lock:
-            return len(self._artifacts)
+    @property
+    def size(self) -> int:
+        return len(self._index)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __contains__(self, artifact_id: str) -> bool:
+        return artifact_id in self._index
+
+
+__all__ = ["OutputStore", "Artifact", "ArtifactNotFound"]
