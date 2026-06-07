@@ -17,5 +17,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[project.urls]
+Homepage = "https://github.com/MukundaKatta/agent-output-store"
+Repository = "https://github.com/MukundaKatta/agent-output-store"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+agent_output_store = ["py.typed"]

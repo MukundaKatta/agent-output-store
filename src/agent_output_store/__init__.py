@@ -59,12 +59,22 @@ class OutputStore:
     Usage::
 
         store = OutputStore("/tmp/run.jsonl")
-        store.store("run-1", "llm_response", {"content": "Hello!"}, tags=["prod"])
-        artifact = store.get("run-1")
+        art = store.store("run-1", "llm_response", {"content": "Hello!"}, tags=["prod"])
+        artifact = store.get(art.artifact_id)
         results = store.search(kind="llm_response")
+        finals = store.search(predicate=lambda a: "final" in a.tags)
     """
 
     def __init__(self, path: Optional[str] = None) -> None:
+        """Create a store, optionally backed by a JSONL file.
+
+        If ``path`` is given and the file exists, existing artifacts are
+        loaded into the in-memory index and the auto-id counter is advanced
+        past any previously auto-generated ids so reloads never collide.
+
+        :param path: Optional path to a JSONL file for persistence. When
+            ``None``, the store is purely in-memory.
+        """
         self._path = path
         self._index: dict[str, Artifact] = {}
         self._lock = threading.Lock()
@@ -82,8 +92,21 @@ class OutputStore:
                     d = json.loads(line)
                     a = Artifact.from_dict(d)
                     self._index[a.artifact_id] = a
+                    self._advance_counter(a.artifact_id)
                 except (json.JSONDecodeError, KeyError):
                     pass
+
+    def _advance_counter(self, artifact_id: str) -> None:
+        """Keep the auto-id counter ahead of any auto-generated id.
+
+        Auto-generated ids have the form ``artifact-NNNNNN``. When ids of
+        that form are loaded or supplied explicitly, the counter is bumped so
+        the next auto-generated id cannot collide with an existing artifact.
+        """
+        if artifact_id.startswith("artifact-"):
+            suffix = artifact_id[len("artifact-"):]
+            if suffix.isdigit():
+                self._counter = max(self._counter, int(suffix))
 
     def _next_id(self) -> str:
         self._counter += 1
@@ -98,8 +121,27 @@ class OutputStore:
         artifact_id: Optional[str] = None,
         **metadata: Any,
     ) -> Artifact:
+        """Store a new artifact and return it.
+
+        The artifact is added to the in-memory index and, if the store is
+        backed by a file, appended to the JSONL file. This method is
+        thread-safe.
+
+        :param run_id: Identifier of the agent run this artifact belongs to.
+        :param kind: Category of the artifact (e.g. ``"llm_response"``).
+        :param data: Arbitrary JSON-serializable payload.
+        :param tags: Optional list of free-form tags.
+        :param artifact_id: Optional explicit id. If omitted, an id of the
+            form ``artifact-NNNNNN`` is generated automatically.
+        :param metadata: Extra keyword arguments stored as metadata.
+        :returns: The created :class:`Artifact`.
+        """
         with self._lock:
-            aid = artifact_id or self._next_id()
+            if artifact_id is None:
+                aid = self._next_id()
+            else:
+                aid = artifact_id
+                self._advance_counter(aid)
             artifact = Artifact(
                 artifact_id=aid,
                 kind=kind,
@@ -115,12 +157,18 @@ class OutputStore:
         return artifact
 
     def get(self, artifact_id: str) -> Artifact:
+        """Return the artifact with the given id.
+
+        :param artifact_id: The id of the artifact to retrieve.
+        :raises ArtifactNotFound: If no artifact has that id.
+        """
         a = self._index.get(artifact_id)
         if a is None:
             raise ArtifactNotFound(artifact_id)
         return a
 
     def get_or_none(self, artifact_id: str) -> Optional[Artifact]:
+        """Return the artifact with the given id, or ``None`` if absent."""
         return self._index.get(artifact_id)
 
     def list(
@@ -130,6 +178,16 @@ class OutputStore:
         tag: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> list[Artifact]:
+        """Return artifacts matching all of the given filters.
+
+        Results are sorted by ``created_at`` (oldest first). All filters are
+        optional; with no filters, every artifact is returned.
+
+        :param run_id: Only include artifacts from this run.
+        :param kind: Only include artifacts of this kind.
+        :param tag: Only include artifacts carrying this tag.
+        :param limit: Cap the number of results returned.
+        """
         results = list(self._index.values())
         if run_id is not None:
             results = [a for a in results if a.run_id == run_id]
@@ -149,12 +207,37 @@ class OutputStore:
         tag: Optional[str] = None,
         predicate: Optional[Callable[[Artifact], bool]] = None,
     ) -> list[Artifact]:
+        """Return artifacts matching the filters and an optional predicate.
+
+        This is :meth:`list` plus an arbitrary ``predicate`` callable applied
+        after the structured filters. Note that ``predicate`` is keyword-only
+        in practice: the first positional argument is ``kind``.
+
+        :param kind: Only include artifacts of this kind.
+        :param run_id: Only include artifacts from this run.
+        :param tag: Only include artifacts carrying this tag.
+        :param predicate: Callable taking an :class:`Artifact` and returning
+            ``True`` to keep it.
+        """
         results = self.list(run_id=run_id, kind=kind, tag=tag)
         if predicate is not None:
             results = [a for a in results if predicate(a)]
         return results
 
     def delete(self, artifact_id: str) -> bool:
+        """Remove an artifact from the in-memory index.
+
+        :param artifact_id: The id of the artifact to remove.
+        :returns: ``True`` if an artifact was removed, ``False`` if no
+            artifact had that id.
+
+        .. note::
+            For file-backed stores the JSONL log is append-only, so the
+            deleted record is not removed from the file. It is filtered out
+            on the next reload only if it is still present in memory at the
+            time the file was written. To physically compact the file, use
+            :meth:`clear` or rewrite the store.
+        """
         with self._lock:
             if artifact_id not in self._index:
                 return False
@@ -162,6 +245,10 @@ class OutputStore:
         return True
 
     def clear(self) -> int:
+        """Remove all artifacts and truncate the backing file if any.
+
+        :returns: The number of artifacts that were removed.
+        """
         with self._lock:
             count = len(self._index)
             self._index.clear()
@@ -181,4 +268,6 @@ class OutputStore:
         return artifact_id in self._index
 
 
-__all__ = ["OutputStore", "Artifact", "ArtifactNotFound"]
+__version__ = "0.1.0"
+
+__all__ = ["OutputStore", "Artifact", "ArtifactNotFound", "__version__"]
