@@ -1,7 +1,10 @@
 """Tests for agent-output-store."""
+
 import threading
+
 import pytest
-from agent_output_store import OutputStore, Artifact, ArtifactNotFound
+
+from agent_output_store import ArtifactNotFound, OutputStore
 
 
 def test_store_and_get():
@@ -142,6 +145,43 @@ def test_persist_and_reload(tmp_path):
     s2 = OutputStore(path)
     got = s2.get(a.artifact_id)
     assert got.data == {"x": 1}
+
+
+def test_reload_does_not_reuse_ids(tmp_path):
+    path = str(tmp_path / "store.jsonl")
+    s1 = OutputStore(path)
+    s1.store(kind="out", data=1)
+    s1.store(kind="out", data=2)
+
+    # Reloading must not reset the auto-id counter; new artifacts must not
+    # collide with existing ones.
+    s2 = OutputStore(path)
+    assert s2.size == 2
+    a3 = s2.store(kind="out", data=3)
+    assert a3.artifact_id not in {"artifact-000001", "artifact-000002"}
+    assert s2.size == 3
+
+
+def test_delete_is_persisted(tmp_path):
+    path = str(tmp_path / "store.jsonl")
+    s1 = OutputStore(path)
+    a1 = s1.store(kind="out", data=1)
+    s1.store(kind="out", data=2)
+    assert s1.delete(a1.artifact_id) is True
+
+    # A reloaded store must not resurrect the deleted artifact.
+    s2 = OutputStore(path)
+    assert s2.size == 1
+    assert s2.get_or_none(a1.artifact_id) is None
+
+
+def test_custom_id_then_auto_id_no_collision(tmp_path):
+    path = str(tmp_path / "store.jsonl")
+    s = OutputStore(path)
+    s.store(kind="out", data=1, artifact_id="artifact-000005")
+    a = s.store(kind="out", data=2)
+    assert a.artifact_id != "artifact-000005"
+    assert s.size == 2
 
 
 def test_thread_safe_concurrent_store():

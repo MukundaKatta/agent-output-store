@@ -1,14 +1,18 @@
 """
 agent-output-store: JSONL artifact store for agent run outputs.
 """
+
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
+
+_AUTO_ID_RE = re.compile(r"^artifact-(\d+)$")
 
 
 @dataclass
@@ -16,7 +20,7 @@ class Artifact:
     artifact_id: str
     kind: str
     data: Any
-    run_id: Optional[str] = None
+    run_id: str | None = None
     created_at: float = field(default_factory=time.time)
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -33,7 +37,7 @@ class Artifact:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Artifact":
+    def from_dict(cls, d: dict[str, Any]) -> Artifact:
         return cls(
             artifact_id=d["artifact_id"],
             kind=d["kind"],
@@ -59,12 +63,12 @@ class OutputStore:
     Usage::
 
         store = OutputStore("/tmp/run.jsonl")
-        store.store("run-1", "llm_response", {"content": "Hello!"}, tags=["prod"])
-        artifact = store.get("run-1")
+        art = store.store("run-1", "llm_response", {"content": "Hello!"}, tags=["prod"])
+        artifact = store.get(art.artifact_id)
         results = store.search(kind="llm_response")
     """
 
-    def __init__(self, path: Optional[str] = None) -> None:
+    def __init__(self, path: str | None = None) -> None:
         self._path = path
         self._index: dict[str, Artifact] = {}
         self._lock = threading.Lock()
@@ -82,24 +86,53 @@ class OutputStore:
                     d = json.loads(line)
                     a = Artifact.from_dict(d)
                     self._index[a.artifact_id] = a
+                    self._bump_counter(a.artifact_id)
                 except (json.JSONDecodeError, KeyError):
                     pass
+
+    def _bump_counter(self, artifact_id: str) -> None:
+        """Advance the auto-id counter past any auto-generated id we've seen.
+
+        Without this, reloading a store would reset the counter to 0 and cause
+        newly generated ids to collide with (and overwrite) existing artifacts.
+        """
+        m = _AUTO_ID_RE.match(artifact_id)
+        if m:
+            self._counter = max(self._counter, int(m.group(1)))
 
     def _next_id(self) -> str:
         self._counter += 1
         return f"artifact-{self._counter:06d}"
 
+    def _rewrite(self) -> None:
+        """Persist the current in-memory index to disk, replacing the file.
+
+        Used after deletions so removed artifacts do not reappear on reload.
+        Caller must hold ``self._lock``.
+        """
+        if not self._path:
+            return
+        tmp = f"{self._path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for artifact in self._index.values():
+                fh.write(json.dumps(artifact.to_dict()) + "\n")
+        os.replace(tmp, self._path)
+
     def store(
         self,
-        run_id: Optional[str] = None,
+        run_id: str | None = None,
         kind: str = "output",
         data: Any = None,
-        tags: Optional[list[str]] = None,
-        artifact_id: Optional[str] = None,
+        tags: list[str] | None = None,
+        artifact_id: str | None = None,
         **metadata: Any,
     ) -> Artifact:
         with self._lock:
-            aid = artifact_id or self._next_id()
+            if artifact_id is not None:
+                aid = artifact_id
+                self._bump_counter(aid)
+            else:
+                aid = self._next_id()
             artifact = Artifact(
                 artifact_id=aid,
                 kind=kind,
@@ -120,15 +153,15 @@ class OutputStore:
             raise ArtifactNotFound(artifact_id)
         return a
 
-    def get_or_none(self, artifact_id: str) -> Optional[Artifact]:
+    def get_or_none(self, artifact_id: str) -> Artifact | None:
         return self._index.get(artifact_id)
 
     def list(
         self,
-        run_id: Optional[str] = None,
-        kind: Optional[str] = None,
-        tag: Optional[str] = None,
-        limit: Optional[int] = None,
+        run_id: str | None = None,
+        kind: str | None = None,
+        tag: str | None = None,
+        limit: int | None = None,
     ) -> list[Artifact]:
         results = list(self._index.values())
         if run_id is not None:
@@ -144,10 +177,10 @@ class OutputStore:
 
     def search(
         self,
-        kind: Optional[str] = None,
-        run_id: Optional[str] = None,
-        tag: Optional[str] = None,
-        predicate: Optional[Callable[[Artifact], bool]] = None,
+        kind: str | None = None,
+        run_id: str | None = None,
+        tag: str | None = None,
+        predicate: Callable[[Artifact], bool] | None = None,
     ) -> list[Artifact]:
         results = self.list(run_id=run_id, kind=kind, tag=tag)
         if predicate is not None:
@@ -159,6 +192,8 @@ class OutputStore:
             if artifact_id not in self._index:
                 return False
             del self._index[artifact_id]
+            if self._path:
+                self._rewrite()
         return True
 
     def clear(self) -> int:
